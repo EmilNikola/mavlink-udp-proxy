@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <sys/time.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -27,13 +28,33 @@
 #define SERVER_PATH "/tmp/chobits_server"
 #define SERVER_PATH2 "/tmp/chobits_server2"
 
-void sig_func(int sig) {
+int ipc_fd, ipc_fd2, py_fd, uart_fd;
+FILE *fptr = nullptr;
+int mode = 1; // 0 = save to file, 1 = send realtime
+
+
+void handle_signal(int sig) {
+    if (mode == 0 && fptr != nullptr) {
+        fclose(fptr);
+        fptr = nullptr;
+    }
+    if (ipc_fd >= 0) close(ipc_fd);
+    if (py_fd >= 0) close(py_fd);
+    if (uart_fd >= 0) close(uart_fd);
+    if (ipc_fd2 >= 0) close(ipc_fd2);
+    unlink(SERVER_PATH);
+    unlink(SERVER_PATH2);
+    printf("bye\n");
+
+    exit(0);
 }
 
 int main(int argc, char *argv[]) {
+    const char *python_ip = "192.168.12.46";
+    int python_port = 10000;
     struct pollfd pfds[MY_NUM_PFDS];
     struct timeval tv;
-    int retval, uart_fd;
+    int retval;
     unsigned int len;
     unsigned char buf[1024];
     ssize_t avail;
@@ -42,19 +63,41 @@ int main(int argc, char *argv[]) {
     // Create new termios struc, we call it 'tty' for convention
     struct termios tty;
     struct sockaddr_un ipc_addr, ipc_addr2;
+    struct sockaddr_in py_addr;
     uint8_t mav_sysid = 0;
-    int ipc_fd, ipc_fd2;
     int64_t time_offset_us = 0;
     bool no_local_pos = true;
     int parse_error = 0, packet_rx_drop_count = 0;
     int64_t tc1_sent = 0;
     float vins_apm_alt_diff = 0;
     float latest_vins_alt = 0;
+    char filename[50];
+    struct tm *tm_info;
 
-    if (argc > 1)
-        uart_fd = open(argv[1], O_RDWR| O_NOCTTY);
-    else
-        uart_fd = open("/dev/ttyAMA0", O_RDWR | O_NOCTTY);
+    signal(SIGINT, handle_signal);
+
+    // Parse command-line arguments
+    printf("Usage: %s [--mode (save to file <save> or send realtime? <realtime>)][--python-ip <ip>] [--python-port <port>]\n", argv[0]);
+    uart_fd = open("/dev/ttyAMA0", O_RDWR | O_NOCTTY);
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--mode") == 0 && i + 1 < argc) {
+            if (strcmp(argv[++i], "save") == 0) {
+                mode = 0;
+            } else if (strcmp(argv[i], "realtime") == 0) {
+                mode = 1;
+            } else {
+                printf("Invalid mode specified. Using default 'realtime' mode.\n");
+            }
+        } else if (strcmp(argv[i], "--python-ip") == 0 && i + 1 < argc) {
+            python_ip = argv[++i];
+        } else if (strcmp(argv[i], "--python-port") == 0 && i + 1 < argc) {
+            python_port = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--port") == 0) {
+            close (uart_fd);
+            uart_fd = open(argv[++i], O_RDWR| O_NOCTTY);
+        }
+    }
+
     if (uart_fd < 0) {
         printf("can not open serial port\n");
         return 1;
@@ -90,6 +133,7 @@ int main(int argc, char *argv[]) {
     }
 
     if ((ipc_fd = socket(AF_UNIX, SOCK_DGRAM, 0)) < 0) {
+        perror("socket creation failed (ipc_fd)");
         return 1;
     }
     memset(&ipc_addr, 0, sizeof(ipc_addr));
@@ -97,11 +141,12 @@ int main(int argc, char *argv[]) {
     strcpy(ipc_addr.sun_path, SERVER_PATH);
     unlink(SERVER_PATH);
     if (bind(ipc_fd, (const struct sockaddr *)&ipc_addr, sizeof(ipc_addr)) < 0) {
-        printf("bind local failed\n");
+        perror("bind failed (ipc_fd)");
         return 1;
     }
 
     if ((ipc_fd2 = socket(AF_UNIX, SOCK_DGRAM, 0)) < 0) {
+        perror("socket creation failed (ipc_fd2)");
         return 1;
     }
     memset(&ipc_addr2, 0, sizeof(ipc_addr2));
@@ -109,9 +154,19 @@ int main(int argc, char *argv[]) {
     strcpy(ipc_addr2.sun_path, SERVER_PATH2);
     unlink(SERVER_PATH2);
     if (bind(ipc_fd2, (const struct sockaddr *)&ipc_addr2, sizeof(ipc_addr2)) < 0) {
-        printf("bind local failed\n");
+        perror("bind failed (ipc_fd2)");
         return 1;
     }
+
+    if ((py_fd = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
+        perror("socket creation failed (py_fd)");
+        return 1;
+    }
+    memset(&py_addr, 0, sizeof(py_addr));
+    py_addr.sin_family = AF_INET;
+    py_addr.sin_port = htons(python_port);
+    inet_pton(AF_INET, python_ip, &py_addr.sin_addr);
+
 
     pfds[0].fd= uart_fd;
     pfds[0].events = POLLIN;
@@ -120,7 +175,20 @@ int main(int argc, char *argv[]) {
     pfds[2].fd= ipc_fd2;
     pfds[2].events = POLLIN;
 
-    signal(SIGINT, sig_func);
+    if (mode == 0) {
+        gettimeofday(&tv, NULL);
+        tm_info = localtime(&tv.tv_sec);
+        strftime(filename, sizeof(filename), "log-%Y-%m-%d-%H-%M.txt", tm_info);
+        fptr = fopen(filename, "w");
+        if (fptr == NULL) {
+            perror("Error opening file");
+            return EXIT_FAILURE;
+        }
+        fprintf
+            (fptr
+            , "UNIX_SECONDS.UNIX_MICROSECONDS,PX,PY,PZ,VX,VY,VZ,QX,QY,QZ,QW\n"
+            );
+    }
 
     printf("hello\n");
 
@@ -150,7 +218,7 @@ int main(int argc, char *argv[]) {
                             printf("mavlink drop %d\n", packet_rx_drop_count);
                         }
                         if (msg.sysid == 255) continue;
-                        //printf("recv msg ID %d, seq %d\n", msg.msgid, msg.seq);
+                            //printf("recv msg ID %d, seq %d\n", msg.msgid, msg.seq);
                         if (msg.msgid == MAVLINK_MSG_ID_HEARTBEAT) {
                             mavlink_heartbeat_t hb;
                             mavlink_msg_heartbeat_decode(&msg, &hb);
@@ -183,7 +251,7 @@ int main(int argc, char *argv[]) {
                             mavlink_msg_timesync_decode(&msg, &ts);
                             if (ts.ts1 == tc1_sent) {
                                 time_offset_us = (ts.ts1 - ts.tc1)/1000;
-                                printf("time offset %ld\n", time_offset_us);
+                                printf("time offset %ld\n", time_offset_us); //lld?
                             }
                         } else if (msg.msgid == MAVLINK_MSG_ID_STATUSTEXT) {
                             mavlink_statustext_t txt;
@@ -222,6 +290,29 @@ int main(int argc, char *argv[]) {
             if (pfds[1].revents & POLLIN) {
                 float pose[10];
                 if (recv(ipc_fd, pose, sizeof(pose), 0) > 0) {
+                    if (mode == 0) {
+                        gettimeofday(&tv, NULL);
+                        fprintf(
+                            fptr
+                        , "%ld.%06ld,%f,%f,%f,%f,%f,%f,%f,%f,%f,%f\n"
+                        , tv.tv_sec
+                        , tv.tv_usec
+                        , pose[4] // px position
+                        , pose[5] // py
+                        , pose[6] // pz
+                        , pose[7] // vx velocity
+                        , pose[8] // vy
+                        , pose[9] // vz
+                        , pose[1] // qx orientation quaternion
+                        , pose[2] // qy
+                        , pose[3] // qz
+                        , pose[0] // qw
+                        );
+
+                        fflush(fptr);
+                    } else if (mode == 1) {
+                        sendto(py_fd, pose, sizeof(pose), 0, (const struct sockaddr*)&py_addr, sizeof(py_addr));
+                    }
                     latest_vins_alt = pose[3];
                     float covar[21] = {0};
                     pose[2]=-pose[2];
@@ -262,13 +353,17 @@ int main(int argc, char *argv[]) {
         } else break;
     }
 
-    close(uart_fd);
-    close(ipc_fd);
-    close(ipc_fd2);
+    if (mode == 0 && fptr != nullptr) {
+        fclose(fptr);
+        fptr = nullptr;
+    }
+    if (ipc_fd >= 0) close(ipc_fd);
+    if (py_fd >= 0) close(py_fd);
+    if (uart_fd >= 0) close(uart_fd);
+    if (ipc_fd2 >= 0) close(ipc_fd2);
     unlink(SERVER_PATH);
     unlink(SERVER_PATH2);
-
     printf("bye\n");
-
+    
     return 0;
 }
