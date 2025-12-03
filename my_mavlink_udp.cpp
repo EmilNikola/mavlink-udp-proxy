@@ -28,7 +28,9 @@
 #define SERVER_PATH "/tmp/chobits_server"
 #define SERVER_PATH2 "/tmp/chobits_server2"
 
-int ipc_fd, ipc_fd2, py_fd, uart_fd;
+int ipc_fd, ipc_fd2, py_fd, uart_fd, mirror_fd;
+bool mirror_enabled = false;
+struct sockaddr_in mirror_addr;
 FILE *fptr = nullptr;
 int mode = 1; // 0 = save to file, 1 = send realtime
 
@@ -42,6 +44,7 @@ void handle_signal(int sig) {
     if (py_fd >= 0) close(py_fd);
     if (uart_fd >= 0) close(uart_fd);
     if (ipc_fd2 >= 0) close(ipc_fd2);
+    if (mirror_fd >= 0) close(mirror_fd);
     unlink(SERVER_PATH);
     unlink(SERVER_PATH2);
     printf("bye\n");
@@ -49,9 +52,18 @@ void handle_signal(int sig) {
     exit(0);
 }
 
+// mirror the exact data send to fc
+void send_mav(const uint8_t* data, unsigned int len) {
+    if (uart_fd >= 0) { write(uart_fd, data, len); }
+    if (mirror_enabled && mirror_fd >= 0) {
+        sendto(mirror_fd, data, len, 0, (const struct sockaddr*)&mirror_addr, sizeof(mirror_addr));
+    }
+}
+
 int main(int argc, char *argv[]) {
-    const char *python_ip = "192.168.12.46";
+    const char *ip = "192.168.12.46";
     int python_port = 10000;
+    int mirror_port = 14550; // i have yet to allow this port in my configuration.nix
     struct pollfd pfds[MY_NUM_PFDS];
     struct timeval tv;
     int retval;
@@ -77,10 +89,14 @@ int main(int argc, char *argv[]) {
     signal(SIGINT, handle_signal);
 
     // Parse command-line arguments
-    printf("Usage: %s [--mode (save to file <save> or send realtime? <realtime>)][--python-ip <ip>] [--python-port <port>]\n", argv[0]);
+    printf("Usage: %s [--mirror <y/n>] [--mode (save to file <save> or send realtime? <realtime>)][--python-ip <ip>] [--python-port <port>]\n", argv[0]);
     uart_fd = open("/dev/ttyAMA0", O_RDWR | O_NOCTTY);
     for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "--mode") == 0 && i + 1 < argc) {
+        if (strcmp(argv[i], "--mirror") == 0 && i + 1 < argc) {
+            if (strcmp(argv[++i], "y") == 0) {
+                mirror_enabled = true;
+            }
+        } else if (strcmp(argv[i], "--mode") == 0 && i + 1 < argc) {
             if (strcmp(argv[++i], "save") == 0) {
                 mode = 0;
             } else if (strcmp(argv[i], "realtime") == 0) {
@@ -89,10 +105,10 @@ int main(int argc, char *argv[]) {
                 printf("Invalid mode specified. Using default 'realtime' mode.\n");
             }
         } else if (strcmp(argv[i], "--python-ip") == 0 && i + 1 < argc) {
-            python_ip = argv[++i];
+            ip = argv[++i];
         } else if (strcmp(argv[i], "--python-port") == 0 && i + 1 < argc) {
             python_port = atoi(argv[++i]);
-        } else if (strcmp(argv[i], "--port") == 0) {
+        } else if (strcmp(argv[i], "--port") == 0 && i + 1 < argc) {
             close (uart_fd);
             uart_fd = open(argv[++i], O_RDWR| O_NOCTTY);
         }
@@ -165,8 +181,20 @@ int main(int argc, char *argv[]) {
     memset(&py_addr, 0, sizeof(py_addr));
     py_addr.sin_family = AF_INET;
     py_addr.sin_port = htons(python_port);
-    inet_pton(AF_INET, python_ip, &py_addr.sin_addr);
+    inet_pton(AF_INET, ip, &py_addr.sin_addr);
 
+
+    if (mirror_enabled) {
+        if ((mirror_fd = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
+            perror("socket creation failed (mirror_fd)");
+            return 1;
+        }
+    
+        memset(&mirror_addr, 0, sizeof(mirror_addr));
+        mirror_addr.sin_family = AF_INET;
+        mirror_addr.sin_port = htons(mirror_port);
+        inet_pton(AF_INET, ip, &mirror_addr.sin_addr);
+    }
 
     pfds[0].fd= uart_fd;
     pfds[0].events = POLLIN;
@@ -231,20 +259,24 @@ int main(int argc, char *argv[]) {
                                 tc1_sent = tv.tv_sec*1000000000+tv.tv_usec*1000;
                                 mavlink_msg_timesync_pack(mav_sysid, MY_COMP_ID, &msg, 0, tc1_sent, mav_sysid, 1);
                                 len = mavlink_msg_to_send_buffer(buf, &msg);
-                                write(uart_fd, buf, len);
+                                //write(uart_fd, buf, len);
+                                send_mav(buf, len);
 
                                 mavlink_msg_system_time_pack(mav_sysid, MY_COMP_ID, &msg, tv.tv_sec*1000000+tv.tv_usec, 0);
                                 len = mavlink_msg_to_send_buffer(buf, &msg);
-                                write(uart_fd, buf, len);
+                                //write(uart_fd, buf, len);
+                                send_mav(buf, len);
 
                                 mavlink_msg_set_gps_global_origin_pack(mav_sysid, MY_COMP_ID, &msg, mav_sysid, 247749434, 1210443077, 100000, tv.tv_sec*1000000+tv.tv_usec);
                                 len = mavlink_msg_to_send_buffer(buf, &msg);
-                                write(uart_fd, buf, len);
+                                //write(uart_fd, buf, len);
+                                send_mav(buf, len);
                             }
                             if (no_local_pos) {
                                 mavlink_msg_command_long_pack(mav_sysid, MY_COMP_ID, &msg, 0, 0, MAV_CMD_SET_MESSAGE_INTERVAL, 0, MAVLINK_MSG_ID_LOCAL_POSITION_NED, 50000, 0, 0, 0, 0, 0);
                                 len = mavlink_msg_to_send_buffer(buf, &msg);
-                                write(uart_fd, buf, len);
+                                //write(uart_fd, buf, len);
+                                send_mav(buf, len);
                             }
                         } else if (msg.msgid == MAVLINK_MSG_ID_TIMESYNC) {
                             mavlink_timesync_t ts;
@@ -321,11 +353,15 @@ int main(int argc, char *argv[]) {
                         gettimeofday(&tv, NULL);
                         mavlink_msg_att_pos_mocap_pack(mav_sysid, MY_COMP_ID, &msg, tv.tv_sec*1000000+tv.tv_usec, pose, pose[4], -pose[5], -pose[6], covar);
                         len = mavlink_msg_to_send_buffer(buf, &msg);
-                        write(uart_fd, buf, len);
+                                //write(uart_fd, buf, len);
+                                send_mav(buf, len);
+
                         gettimeofday(&tv, NULL);
                         mavlink_msg_vision_speed_estimate_pack(mav_sysid, MY_COMP_ID, &msg, tv.tv_sec*1000000+tv.tv_usec, pose[7], -pose[8], -pose[9], covar, 0);
                         len = mavlink_msg_to_send_buffer(buf, &msg);
-                        write(uart_fd, buf, len);
+                                //write(uart_fd, buf, len);
+                                send_mav(buf, len);
+
                     }
                 }
             }
@@ -339,13 +375,17 @@ int main(int argc, char *argv[]) {
                             gettimeofday(&tv, NULL);
                             mavlink_msg_set_mode_pack(mav_sysid, MY_COMP_ID, &msg, mav_sysid, 1, 9); //land
                             len = mavlink_msg_to_send_buffer(buf, &msg);
-                            write(uart_fd, buf, len);
+                            //write(uart_fd, buf, len);
+                            send_mav(buf, len);
+
                         }
                     } else {
                         gettimeofday(&tv, NULL);
                         mavlink_msg_set_position_target_local_ned_pack(mav_sysid, MY_COMP_ID, &msg, tv.tv_sec*1000+tv.tv_usec*0.001, 0, 0, MAV_FRAME_LOCAL_NED, 0xc00, planner_msg[0], -planner_msg[1], -(planner_msg[2]-vins_apm_alt_diff), planner_msg[3], -planner_msg[4], -planner_msg[5], planner_msg[6], -planner_msg[7], -planner_msg[8], 0, 0);
                         len = mavlink_msg_to_send_buffer(buf, &msg);
-                        write(uart_fd, buf, len);
+                        //write(uart_fd, buf, len);
+                        send_mav(buf, len);
+
                     }
                 }
             }
@@ -361,6 +401,7 @@ int main(int argc, char *argv[]) {
     if (py_fd >= 0) close(py_fd);
     if (uart_fd >= 0) close(uart_fd);
     if (ipc_fd2 >= 0) close(ipc_fd2);
+    if (mirror_fd >= 0) close(mirror_fd);
     unlink(SERVER_PATH);
     unlink(SERVER_PATH2);
     printf("bye\n");
